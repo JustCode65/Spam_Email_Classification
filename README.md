@@ -1,4 +1,4 @@
-# Spam Email Classification
+# Spam Email Classification (open spam_classification.Rmd in RStudio or Posit Cloud)
 
 A comparative analysis of classical machine learning methods for detecting spam emails, using 57 engineered features extracted from 4,601 email messages.
 
