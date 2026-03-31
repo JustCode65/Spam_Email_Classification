@@ -1,0 +1,343 @@
+---
+title: "Spam Email Classifier"
+author: "Justin Kim"
+date: "2025-06-07"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+## Setup & data loading
+
+```{r load-data}
+library(ggplot2)
+library(gridExtra)
+library(MASS)
+library(e1071)
+
+# load in train and test sets
+train_raw <- read.table("data/spam-train.txt", sep = ",", header = FALSE)
+test_raw  <- read.table("data/spam-test.txt",  sep = ",", header = FALSE)
+
+# cols 1-57 = features, col 58 = spam label (0 or 1)
+X_train <- train_raw[, 1:57]
+y_train <- train_raw[, 58]
+X_test  <- test_raw[, 1:57]
+y_test  <- test_raw[, 58]
+
+# convert labels to factors for classification functions
+y_train_fac <- factor(y_train, levels = c(0, 1), labels = c("ham", "spam"))
+y_test_fac  <- factor(y_test,  levels = c(0, 1), labels = c("ham", "spam"))
+```
+
+## Preprocessing
+
+I'm trying three different transformations on the raw features to see
+which one gives classifiers the best shot at separating spam from ham.
+
+### Standardize (zero mean, unit var)
+
+```{r preprocess-std}
+# important: fit stats on train only, then apply to both
+col_means <- apply(X_train, 2, mean)
+col_sds   <- apply(X_train, 2, sd)
+
+X_train_std <- scale(X_train, center = col_means, scale = col_sds)
+X_test_std  <- scale(X_test,  center = col_means, scale = col_sds)
+```
+
+### Log transform
+
+```{r preprocess-log}
+# log(x+1) -- the +1 keeps zeros from blowing up
+X_train_log <- log(X_train + 1)
+X_test_log  <- log(X_test + 1)
+```
+
+### Binarize
+
+```{r preprocess-bin}
+# just checking if the feature is nonzero
+X_train_bin <- as.data.frame((X_train > 0) * 1)
+X_test_bin  <- as.data.frame((X_test > 0) * 1)
+```
+
+---
+
+## (a) PCA visualization
+
+Reducing to 2 dimensions with PCA so I can actually see what's going on.
+
+```{r pca-plots, fig.width=14, fig.height=5}
+# standardized -- already centered/scaled so no need to redo
+pca1 <- prcomp(X_train_std, center = FALSE, scale. = FALSE)
+df1 <- data.frame(PC1 = pca1$x[,1], PC2 = pca1$x[,2], Label = y_train_fac)
+
+p1 <- ggplot(df1, aes(PC1, PC2, color = Label)) +
+  geom_point(alpha = 0.6, size = 1) +
+  labs(title = "Standardized Features") +
+  theme_minimal()
+
+# log -- let prcomp handle centering/scaling
+pca2 <- prcomp(X_train_log, center = TRUE, scale. = TRUE)
+df2 <- data.frame(PC1 = pca2$x[,1], PC2 = pca2$x[,2], Label = y_train_fac)
+
+p2 <- ggplot(df2, aes(PC1, PC2, color = Label)) +
+  geom_point(alpha = 0.6, size = 1) +
+  labs(title = "log(x+1) Features") +
+  theme_minimal()
+
+# binary -- center but don't scale (scaling 0/1 vars is weird)
+pca3 <- prcomp(as.data.frame(lapply(X_train_bin, as.numeric)),
+               center = TRUE, scale. = FALSE)
+df3 <- data.frame(PC1 = pca3$x[,1], PC2 = pca3$x[,2], Label = y_train_fac)
+
+p3 <- ggplot(df3, aes(PC1, PC2, color = Label)) +
+  geom_point(alpha = 0.6, size = 1) +
+  labs(title = "Binarized Features") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+All three show some separation between spam and ham along the first two PCs,
+but the log-transformed version seems to give the cleanest clusters. The
+binarized features compress everything into a tight grid since every value
+is 0 or 1.
+
+---
+
+## (b) Logistic regression
+
+```{r logistic-helper}
+# threshold for bonferroni correction -- testing 57 predictors
+bonf_cutoff <- 0.05 / ncol(X_train_std)
+
+# helper to fit logistic regression and return errors + significant vars
+logreg <- function(xtr, ytr, xte, yte) {
+  df_tr <- data.frame(xtr, y = ytr)
+  df_te <- data.frame(xte, y = yte)
+
+  fit <- glm(y ~ ., data = df_tr, family = binomial)
+
+  # predict on both sets
+  phat_tr <- predict(fit, type = "response") > 0.5
+  phat_te <- predict(fit, newdata = df_te, type = "response") > 0.5
+
+  err_tr <- mean(phat_tr != (ytr == "spam"))
+  err_te <- mean(phat_te != (yte == "spam"))
+
+  # pull out p-values
+  ctab <- summary(fit)$coefficients
+  pvals <- ctab[, 4]
+
+  list(
+    train_err = err_tr,
+    test_err  = err_te,
+    sig_005   = names(pvals)[pvals < 0.05],
+    sig_bonf  = names(pvals)[pvals < bonf_cutoff],
+    coef_tab  = ctab
+  )
+}
+```
+
+```{r logistic-fit}
+lr_std <- logreg(X_train_std, y_train_fac, X_test_std, y_test_fac)
+lr_log <- logreg(X_train_log, y_train_fac, X_test_log, y_test_fac)
+lr_bin <- logreg(X_train_bin, y_train_fac, X_test_bin, y_test_fac)
+```
+
+### Classification errors
+
+```{r logistic-table}
+lr_errs <- data.frame(
+  Preprocessing = c("Standardized", "Log-transformed", "Binarized"),
+  Train = c(lr_std$train_err, lr_log$train_err, lr_bin$train_err),
+  Test  = c(lr_std$test_err,  lr_log$test_err,  lr_bin$test_err)
+)
+knitr::kable(lr_errs, digits = 3, col.names = c("Preprocessing", "Train Err", "Test Err"))
+```
+
+### Significant predictors
+
+```{r logistic-sig}
+cat("Standardized -- p < 0.05:\n",
+    paste(lr_std$sig_005, collapse = ", "), "\n\n")
+
+cat("Standardized -- Bonferroni (p <", round(bonf_cutoff, 5), "):\n",
+    paste(lr_std$sig_bonf, collapse = ", "), "\n\n")
+
+cat("Log -- p < 0.05:\n",
+    paste(lr_log$sig_005, collapse = ", "), "\n\n")
+
+cat("Log -- Bonferroni:\n",
+    paste(lr_log$sig_bonf, collapse = ", "), "\n\n")
+
+cat("Binarized -- p < 0.05:\n",
+    paste(lr_bin$sig_005, collapse = ", "), "\n\n")
+
+cat("Binarized -- Bonferroni:\n",
+    paste(lr_bin$sig_bonf, collapse = ", "), "\n")
+```
+
+Across all three, the log version had the lowest test error (~5.7%), then
+standardized (~7.3%), and binarized last (~8.1%). With 57 predictors, a
+bunch show up as significant at the unadjusted p < 0.05 level, but after
+Bonferroni correction (α* ≈ 0.00088), only about a dozen survive. The ones
+that keep showing up regardless of preprocessing are V5, V7, V16, V17, V21,
+V23, V25, V27, V45, V46, V52, V53 -- these are the heavy hitters for spam
+detection (word frequencies like "free", "remove", "your" plus capital letter
+statistics). The binarized model also flags a few more (V11, V13, V24, V28,
+V37, V42), which makes sense since for a lot of these tokens, just knowing
+whether they appear at all carries most of the information.
+
+---
+
+## (c) LDA & QDA
+
+Only running these on standardized and log-transformed data. Binary features
+make QDA's covariance estimation unstable so I left that out.
+
+```{r da-helper}
+disc_analysis <- function(type, xtr, ytr, xte, yte) {
+  df_tr <- data.frame(xtr, y = ytr)
+  df_te <- data.frame(xte, y = yte)
+
+  if (type == "lda") {
+    mod <- lda(y ~ ., data = df_tr)
+  } else {
+    mod <- qda(y ~ ., data = df_tr)
+  }
+
+  pred_tr <- predict(mod, df_tr)$class
+  pred_te <- predict(mod, df_te)$class
+
+  c(train_error = mean(pred_tr != ytr),
+    test_error  = mean(pred_te != yte))
+}
+```
+
+```{r da-fit}
+lda_std_res <- disc_analysis("lda", X_train_std, y_train_fac, X_test_std, y_test_fac)
+qda_std_res <- disc_analysis("qda", X_train_std, y_train_fac, X_test_std, y_test_fac)
+lda_log_res <- disc_analysis("lda", X_train_log, y_train_fac, X_test_log, y_test_fac)
+qda_log_res <- disc_analysis("qda", X_train_log, y_train_fac, X_test_log, y_test_fac)
+
+da_errs <- data.frame(
+  Method = c("LDA (Standardized)", "QDA (Standardized)",
+             "LDA (Log-transformed)", "QDA (Log-transformed)"),
+  Train = c(lda_std_res["train_error"], qda_std_res["train_error"],
+            lda_log_res["train_error"], qda_log_res["train_error"]),
+  Test  = c(lda_std_res["test_error"], qda_std_res["test_error"],
+            lda_log_res["test_error"], qda_log_res["test_error"])
+)
+knitr::kable(da_errs, digits = 3, col.names = c("Method", "Training Error", "Test Error"))
+```
+
+QDA does noticeably worse than LDA here -- probably overfitting because
+it has to estimate a full 57×57 covariance matrix per class and there
+aren't enough samples to do that reliably.
+
+---
+
+## (d) SVM
+
+Testing linear and RBF kernels on all three preprocessed versions.
+
+```{r svm-helper}
+fit_svm <- function(kern, xtr, ytr, xte, yte) {
+  df_tr <- data.frame(xtr, y = ytr)
+  df_te <- data.frame(xte, y = yte)
+
+  mod <- svm(y ~ ., data = df_tr,
+             kernel = kern,
+             cost = 1,
+             gamma = 1 / ncol(xtr),
+             scale = FALSE)
+
+  p_tr <- predict(mod, df_tr)
+  p_te <- predict(mod, df_te)
+
+  c(train_error = mean(p_tr != ytr),
+    test_error  = mean(p_te != yte))
+}
+```
+
+```{r svm-fit}
+data_versions <- list(
+  Std = list(tr = X_train_std, te = X_test_std),
+  Log = list(tr = X_train_log, te = X_test_log),
+  Bin = list(tr = X_train_bin, te = X_test_bin)
+)
+
+svm_res <- do.call(rbind, lapply(names(data_versions), function(v) {
+  d <- data_versions[[v]]
+  lin <- fit_svm("linear", d$tr, y_train_fac, d$te, y_test_fac)
+  rbf <- fit_svm("radial", d$tr, y_train_fac, d$te, y_test_fac)
+
+  data.frame(
+    Preprocessing = v,
+    Kernel = c("Linear", "RBF"),
+    Train  = c(lin["train_error"], rbf["train_error"]),
+    Test   = c(lin["test_error"],  rbf["test_error"])
+  )
+}))
+
+knitr::kable(svm_res, digits = 3,
+             col.names = c("Preprocessing", "Kernel", "Train Err", "Test Err"))
+```
+
+---
+
+## All results
+
+```{r combined-table}
+# clean up svm results for merging
+svm_fmt <- svm_res
+svm_fmt$Method <- paste("SVM", svm_fmt$Kernel)
+svm_fmt$Data   <- svm_fmt$Preprocessing
+svm_fmt <- svm_fmt[, c("Method", "Data", "Train", "Test")]
+
+everything <- rbind(
+  data.frame(Method = "Logistic", Data = "Standardized",
+             Train = lr_std$train_err, Test = lr_std$test_err),
+  data.frame(Method = "Logistic", Data = "Log",
+             Train = lr_log$train_err, Test = lr_log$test_err),
+  data.frame(Method = "Logistic", Data = "Binarized",
+             Train = lr_bin$train_err, Test = lr_bin$test_err),
+  data.frame(Method = "LDA", Data = "Standardized",
+             Train = as.numeric(lda_std_res["train_error"]),
+             Test  = as.numeric(lda_std_res["test_error"])),
+  data.frame(Method = "QDA", Data = "Standardized",
+             Train = as.numeric(qda_std_res["train_error"]),
+             Test  = as.numeric(qda_std_res["test_error"])),
+  data.frame(Method = "LDA", Data = "Log",
+             Train = as.numeric(lda_log_res["train_error"]),
+             Test  = as.numeric(lda_log_res["test_error"])),
+  data.frame(Method = "QDA", Data = "Log",
+             Train = as.numeric(qda_log_res["train_error"]),
+             Test  = as.numeric(qda_log_res["test_error"])),
+  svm_fmt
+)
+
+knitr::kable(everything, digits = 3,
+             col.names = c("Method", "Data", "Train Error", "Test Error"))
+```
+
+### Conclusions
+
+The linear SVM on log-transformed data gave the best test error at 0.056,
+with the RBF SVM on the same data right behind at ~0.057. The fact that
+a linear kernel does this well tells me the classes are mostly linearly
+separable once the features are log-transformed. Train error (0.058) and
+test error (0.056) are close, so the model isn't overfitting -- that's
+reassuring.
+
+Still, ~5% misclassification means roughly 1 in 20 emails gets the wrong
+label. There's room for improvement with hyperparameter tuning, ensembles,
+or better feature engineering.
