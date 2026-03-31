@@ -1,4 +1,4 @@
-# Spam Email Classification
+# Spam Email Classification (pdf of rmd file shows data, results, and summary. to open rmd, use Rstudio or Posit Cloud)
 
 A comparative study of classical ML classifiers for spam detection, benchmarking different preprocessing strategies against logistic regression, discriminant analysis, and support vector machines.
 
